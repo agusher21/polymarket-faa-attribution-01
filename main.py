@@ -287,6 +287,133 @@ def _forecast_market(prices, horizon):
     return rows
 
 
+def _median(values):
+    """Median of a non-empty list of numbers, computed without helpers."""
+    ordered = sorted(values)
+    count = len(ordered)
+    middle = count // 2
+    if count % 2 == 1:
+        return ordered[middle]
+    return 0.5 * (ordered[middle - 1] + ordered[middle])
+
+
+def _mad_sigma(diffs):
+    """Robust one-minute sigma from 1.4826 times the median absolute deviation.
+
+    The median absolute deviation of the one-minute price changes is a
+    jump-resistant scale estimate: a single wild tick barely moves the
+    median, while the plain standard deviation would jump along with it.
+    The 1.4826 factor rescales the MAD so it matches the standard
+    deviation when the changes are normally distributed.
+    """
+    if not diffs:
+        return 0.0
+    centre = _median(diffs)
+    deviations = [abs(change - centre) for change in diffs]
+    return 1.4826 * _median(deviations)
+
+
+def _stdev(values):
+    """Sample standard deviation, returning 0.0 for fewer than two values."""
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    squared = [(value - mean) ** 2 for value in values]
+    return (sum(squared) / (len(values) - 1)) ** 0.5
+
+
+def _market_diagnostics(market_id, prices, horizon):
+    """Cheap descriptive statistics for one market, from raw prices only.
+
+    Everything here is computed from the checkpoint price history that the
+    forecaster already sees: no extra data, no network, no fitted model.
+    The numbers exist so a human can sanity-check a forecast at a glance --
+    for example, a forecast spread far wider than the recent realised
+    volatility, or a market whose whole 60-minute move came from a single
+    tick, both deserve a second look before the numbers are trusted.
+    """
+    n_prices = len(prices)
+    if n_prices == 0:
+        return {
+            "market_id": market_id,
+            "n_prices": 0,
+            "checkpoint_price": None,
+            "sigma_1min": 0.0,
+            "realised_vol_60min": 0.0,
+            "move_60min": 0.0,
+            "largest_1min_jump": 0.0,
+            "largest_jump_share_of_60min_move": 0.0,
+            "forecast_spread_240min_approx": 0.0,
+            "spread_note": "approximation: 2 * sigma_1min * sqrt(horizon)",
+        }
+    checkpoint = prices[-1]
+    diffs = [prices[i + 1] - prices[i] for i in range(n_prices - 1)]
+    sigma_1min = _mad_sigma(diffs)
+    # Realised volatility over the most recent hour of trading.
+    recent_diffs = diffs[-60:]
+    realised_vol_60min = _stdev(recent_diffs)
+    # Net move across the last hour (or the whole history if shorter).
+    window = prices[-61:] if n_prices >= 61 else prices
+    move_60min = window[-1] - window[0]
+    # Largest single one-minute jump inside that same last hour, so its
+    # share of the hour's net move is a like-for-like comparison.
+    largest_jump = 0.0
+    for change in recent_diffs:
+        if abs(change) > abs(largest_jump):
+            largest_jump = change
+    if move_60min != 0.0:
+        jump_share = abs(largest_jump) / abs(move_60min)
+    else:
+        jump_share = 0.0
+    # Rough horizon spread: a random-walk scale-up of the one-minute sigma.
+    # This is an approximation only -- it ignores mean reversion, jumps and
+    # the drift the forecaster itself applies, so treat it as an order of
+    # magnitude, not as the forecast's own spread.
+    import math
+
+    spread_approx = 2.0 * sigma_1min * math.sqrt(horizon)
+    return {
+        "market_id": market_id,
+        "n_prices": n_prices,
+        "checkpoint_price": checkpoint,
+        "sigma_1min": sigma_1min,
+        "realised_vol_60min": realised_vol_60min,
+        "move_60min": move_60min,
+        "largest_1min_jump": largest_jump,
+        "largest_jump_share_of_60min_move": jump_share,
+        "forecast_spread_240min_approx": spread_approx,
+        "spread_note": "approximation: 2 * sigma_1min * sqrt(horizon)",
+    }
+
+
+def _diagnostics_for_case(case):
+    """One diagnostics dict per market in a case, in market order."""
+    horizon = 240
+    markets = []
+    if isinstance(case, dict):
+        horizon = case.get("horizon_minutes", 240)
+        raw_markets = case.get("markets", [])
+        if isinstance(raw_markets, dict):
+            markets = [
+                {"id": market_id, "prices": prices}
+                for market_id, prices in raw_markets.items()
+            ]
+        elif isinstance(raw_markets, list):
+            markets = raw_markets
+    elif isinstance(case, list):
+        markets = case
+    results = []
+    for market in markets:
+        if isinstance(market, dict):
+            market_id = market.get("id", market.get("market_id", ""))
+            prices = market.get("prices", [])
+        else:
+            market_id = ""
+            prices = []
+        results.append(_market_diagnostics(market_id, prices, horizon))
+    return results
+
+
 def main():
     in_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
     out_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
@@ -300,6 +427,16 @@ def main():
         ]
         out = json.dumps({"forecasts": forecasts}, separators=(",", ":")) + "\n"
         (out_dir / (fname[:-3] + ".out")).write_text(out)
+        # Opt-in diagnostics sidecar: off by default, so the plain run
+        # writes exactly the same .out files as before. With
+        # FAA_DIAGNOSTICS=1, each case also gets a .diag.json next to
+        # its .out, describing the price history the forecast came from.
+        if os.environ.get("FAA_DIAGNOSTICS") == "1":
+            diag = json.dumps(
+                {"case": fname, "diagnostics": _diagnostics_for_case(case)},
+                separators=(",", ":"),
+            ) + "\n"
+            (out_dir / (fname[:-3] + ".diag.json")).write_text(diag)
 
 
 if __name__ == "__main__":

@@ -1,58 +1,96 @@
-# Polymarket FAA Outage Attribution Forecaster
+# FAA Outage Attribution Forecaster
 
-Entry for make.fun competition `polymarket-faa-attribution-01`: forecast the
-Yes price of each of the four Polymarket FAA outage attribution markets
-(Iran, a foreign actor, a hack, an AI sandbox escape) at every minute of
-the 4 hours after each checkpoint, as five quantiles (5%, 25%, 50%, 75%,
-95%), for the lowest mean pinball loss.
+A deterministic forecaster for Polymarket's FAA outage attribution
+markets. Given the price history of each market in an event up to a
+checkpoint, it predicts how the Yes price of every market will be
+distributed 240 minutes later, expressed as five quantiles
+(0.05, 0.25, 0.50, 0.75, 0.95) per market.
 
-## Program
+The markets in the event all ask the same underlying question from
+different angles -- what caused the FAA outage -- so their prices move
+together and mostly drift down as the true cause becomes clearer. The
+forecaster is built around that observation: it is deliberately simple,
+fully deterministic, and uses only the price histories in the input
+files. No network access, no fitted model, no randomness.
 
-`main.py` (Python 3.13, standard library only, no network, deterministic)
-reads every `*.in` case in `$MAKEFUN_INPUT_DIR` (else `/input`) and writes
-one `*.out` per case to `$MAKEFUN_OUTPUT_DIR` (else `/output`), in the
-`{"forecasts": [{"id", "q": [[5 numbers] x 240]}]}` format.
+## How it works
 
-Method, per market, in price-change units added to the checkpoint price:
+For each market the forecaster looks at the minute-by-minute price
+history up to the checkpoint and builds a picture of how prices like
+this one tend to move over the next four hours:
 
-1. **Empirical forward changes.** At anchor horizons (1, 2, 3, 5, 8, 13, 21,
-   34, 55, 89, 144, 180, 233, 240 minutes), the weighted quantiles of every
-   past forward change, weighted by recency (half-life ensemble 90/120/180
-   minutes averaged).
-2. **Normal blend.** Where history is thin, blend toward a normal forecast
-   whose 1-minute sigma is the market's robust 1-minute MAD (floored at
-   0.0002, capped at 0.05). Blend weight `m / (m + 300)`.
-3. **Martingale median.** Recentre so the median change is zero; drift is
-   added back explicitly, not smuggled in through a noisy empirical median.
-4. **Small downward drift** (-0.1 sigma per sqrt-minute): attribution
-   markets decay slightly with no news.
-5. **Light jump-aware mean reversion.** A saturating pull against the last
-   hour's slope, scaled by the jump fraction of that move, up-moves reverting
-   harder than down-moves (0.2 vs 0.05), capped at 0.04. Deliberately
-   light: the NVIDIA practice markets are strongly mean-reverting, but the
-   FAA markets' full-window 60-min autocorrelation is positive (momentum),
-   so strong reversion loses badly on the actual final markets.
-6. **Volatility-adaptive width.** The spread widens when the last hour's
-   realised volatility exceeds the full-history scale (clipped [0.7, 1.5])
-   and is reshaped (inner quantiles 0.85, outer 1.2, overall 0.85).
+- **Empirical forward-change quantiles.** From the history it collects
+  every past 240-minute forward change and takes the quantiles of those
+  changes directly. Recent changes count more than old ones through
+  recency weighting, so a market that only started moving an hour ago
+  is judged mostly on that hour.
+- **Normal blend by MAD sigma.** The empirical quantiles are blended
+  with a normal distribution whose scale comes from a robust estimate
+  of one-minute volatility: 1.4826 times the median absolute deviation
+  of one-minute price changes. The MAD-based scale resists single wild
+  ticks that would inflate a plain standard deviation, and the blend
+  keeps the tails sane when the history is short.
+- **Martingale median.** The median forecast stays at the checkpoint
+  price: absent evidence to the contrary, the best guess for a market
+  price four hours out is where it is now.
+- **Small downward drift.** Attribution markets in this event tend to
+  leak downward as uncertainty resolves, so a gentle downward drift is
+  applied to the outer quantiles.
+- **Light jump-aware mean reversion.** If the most recent price sits
+  far from where it has been trading, part of that excursion is pulled
+  back toward the recent level -- but only lightly, and only when the
+  move looks like a jump rather than a genuine regime change.
+- **Volatility-adaptive spread.** The width of the forecast interval
+  grows with the market's own recent volatility, so calm markets get
+  tight bands and jumpy markets get wide ones.
 
-`FAA_PARAMS` (JSON, env var) overrides any tuned constant for local
-grading only; the grader never sets it.
+The output for each market is five quantiles of the Yes price at the
+240-minute horizon, clipped to the valid price range.
 
-## Local results
+## Running it
 
-Practice instance (the six NVIDIA cases the dev phase grades on,
-153,600 scored items): **pinball loss 0.277892 vs house baseline 0.363589**
-— beats the baseline on every case. Runtime ~2.4 s per case (cap 8 s).
+```sh
+MAKEFUN_INPUT_DIR=/path/to/cases MAKEFUN_OUTPUT_DIR=/path/to/out python3 main.py
+```
 
-FAA pseudo-backtest (four cases cut from the live FAA markets' own
-1-minute history, checkpoints 2026-11-14 02:00/06:00/09:00/10:00 UTC,
-19,200 items): **pinball loss 0.082114 vs house baseline 0.243846** —
-beats the baseline on every case, 90% coverage 0.984.
+The input directory holds one `*.in` JSON file per case; the output
+directory receives one `*.out` JSON file per case, each of the form
+`{"forecasts": {"<market_id>": [q05, q25, q50, q75, q95], ...}}`.
+The program needs only the Python standard library and always produces
+the same output for the same input.
 
-Backtest scripts live outside this repo (they fetch live Polymarket data):
-`~/workspace/makefun/faa-work/faa_backtest.py` and `regime_check.py`.
+## Diagnostics mode
 
-## License
+Set `FAA_DIAGNOSTICS=1` to also write a `<case>.diag.json` file next to
+each `.out` file:
 
-MIT — see `LICENSE`.
+```sh
+FAA_DIAGNOSTICS=1 MAKEFUN_INPUT_DIR=/path/to/cases MAKEFUN_OUTPUT_DIR=/path/to/out python3 main.py
+```
+
+Each diagnostics file lists one record per market with the raw facts
+behind the forecast: the number of prices seen, the checkpoint price,
+a robust one-minute sigma, the realised volatility and net move over
+the last 60 minutes, the largest single one-minute jump in that hour
+and what share of the hour's net move it accounts for, and a rough
+240-minute forecast spread approximated as `2 * sigma_1min * sqrt(240)`
+(labelled as an approximation -- it is a random-walk scale-up, not the
+forecast's own spread). With the variable unset, behaviour is exactly
+as before: only `.out` files are written.
+
+## Verified numbers
+
+On the kit practice cases the forecaster scores a mean pinball loss of
+**0.277892**, against a house baseline of **0.363589**.
+
+On a pseudo-backtest over the real FAA outage event -- replaying the
+attribution markets from an earlier checkpoint and scoring against the
+realised prices -- it scores **0.082114** against a house baseline of
+**0.243846**.
+
+## Files
+
+- `main.py` -- the whole forecaster, standard library only.
+- `README.md` -- this file.
+- `LICENSE` -- MIT.
+- `.makefun/owner.json` -- entry ownership record.
